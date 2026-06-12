@@ -23,6 +23,7 @@ public:
 
 private:
 	bool TryPushdownAggregate(unique_ptr<LogicalOperator> &op);
+	bool TryPushdownUnionAggregate(unique_ptr<LogicalOperator> &op);
 	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override;
 
 private:

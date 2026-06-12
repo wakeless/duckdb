@@ -7,9 +7,14 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 namespace duckdb {
 
@@ -434,9 +439,375 @@ static unique_ptr<LogicalProjection> CreateFinalProjection(Optimizer &optimizer,
 	return projection;
 }
 
+//===--------------------------------------------------------------------===//
+// Aggregate pushdown through UNION ALL
+//===--------------------------------------------------------------------===//
+// An aggregate over a UNION ALL splits into per-leg aggregates when the group keys include a
+// column that is a distinct constant in every leg (a "leg tag", e.g. a literal added by each
+// arm of a union view): groups can never span legs, so the per-leg aggregates are final and
+// need no combine phase. Legs whose scan can absorb a grouped aggregate
+// (TableFunction::pushdown_aggregate) then execute the aggregation inside the scan itself.
+
+static bool IsSupportedUnionAggregate(const BoundAggregateExpression &aggregate) {
+	if (aggregate.GetOrderBys()) {
+		return false;
+	}
+	auto &name = aggregate.Function().GetName().GetIdentifierName();
+	return name == "count_star" || name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg";
+}
+
+static bool GetUnionPushdownOperators(LogicalOperator &op, LogicalAggregate *&aggr, LogicalSetOperation *&setop) {
+	if (op.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || op.children.size() != 1) {
+		return false;
+	}
+	aggr = &op.Cast<LogicalAggregate>();
+	if (!aggr->grouping_functions.empty() || aggr->groups.empty() || aggr->expressions.empty()) {
+		return false;
+	}
+	// plain GROUP BY only: no grouping sets, or a single set covering every group
+	if (aggr->grouping_sets.size() > 1 ||
+	    (aggr->grouping_sets.size() == 1 && aggr->grouping_sets[0].size() != aggr->groups.size())) {
+		return false;
+	}
+	for (auto &expr : aggr->expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return false;
+		}
+		if (!IsSupportedUnionAggregate(expr->Cast<BoundAggregateExpression>())) {
+			return false;
+		}
+	}
+	auto &child = *op.children[0];
+	if (child.type != LogicalOperatorType::LOGICAL_UNION) {
+		return false;
+	}
+	setop = &child.Cast<LogicalSetOperation>();
+	return setop->setop_all && setop->children.size() >= 2;
+}
+
+static bool ReferencesOnly(const Expression &expr, TableIndex table_index) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		return expr.Cast<BoundColumnRefExpression>().Binding().table_index == table_index;
+	}
+	bool result = true;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!ReferencesOnly(child, table_index)) {
+			result = false;
+		}
+	});
+	return result;
+}
+
+//! Every group must be a plain reference to a union output column
+static bool GetUnionGroupColumns(const LogicalAggregate &aggr, const LogicalSetOperation &setop,
+                                 vector<idx_t> &group_columns) {
+	for (auto &group : aggr.groups) {
+		ColumnBinding binding;
+		if (!GetColumnBinding(*group, binding)) {
+			return false;
+		}
+		if (binding.table_index != setop.table_index) {
+			return false;
+		}
+		group_columns.push_back(binding.column_index.GetIndex());
+	}
+	return true;
+}
+
+//! Resolve a union output column within a leg, descending through column-reference projection
+//! steps; returns the defining expression, or nullptr when it cannot be traced.
+static const Expression *ResolveLegColumn(const LogicalOperator &leg, idx_t column) {
+	auto op = &leg;
+	idx_t col = column;
+	while (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (col >= op->expressions.size()) {
+			return nullptr;
+		}
+		auto &expr = *op->expressions[col];
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return &expr;
+		}
+		auto &binding = expr.Cast<BoundColumnRefExpression>().Binding();
+		auto child_bindings = op->children[0]->GetColumnBindings();
+		optional_idx next;
+		for (idx_t i = 0; i < child_bindings.size(); i++) {
+			if (child_bindings[i] == binding) {
+				next = i;
+				break;
+			}
+		}
+		if (!next.IsValid()) {
+			return nullptr;
+		}
+		col = next.GetIndex();
+		op = op->children[0].get();
+	}
+	return nullptr;
+}
+
+//! Whether any group key resolves to a non-NULL constant that differs in every leg, which makes
+//! groups leg-disjoint
+static bool HasDisjointLegTag(const LogicalSetOperation &setop, const vector<idx_t> &group_columns) {
+	for (auto &col : group_columns) {
+		vector<Value> values;
+		for (auto &leg : setop.children) {
+			auto expr = ResolveLegColumn(*leg, col);
+			if (!expr || expr->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+				break;
+			}
+			auto &value = expr->Cast<BoundConstantExpression>().GetValue();
+			if (value.IsNull()) {
+				break;
+			}
+			values.push_back(value);
+		}
+		if (values.size() != setop.children.size()) {
+			continue;
+		}
+		bool all_distinct = true;
+		for (idx_t i = 0; all_distinct && i < values.size(); i++) {
+			for (idx_t j = i + 1; j < values.size(); j++) {
+				if (!ValueOperations::DistinctFrom(values[i], values[j])) {
+					all_distinct = false;
+					break;
+				}
+			}
+		}
+		if (all_distinct) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The scan at the bottom of a projection-only chain, if it can absorb aggregates
+static optional_ptr<LogicalGet> FindAggregatePushdownGet(LogicalOperator &leg) {
+	reference<LogicalOperator> op(leg);
+	while (op.get().type == LogicalOperatorType::LOGICAL_PROJECTION && op.get().children.size() == 1) {
+		op = *op.get().children[0];
+	}
+	if (op.get().type != LogicalOperatorType::LOGICAL_GET) {
+		return nullptr;
+	}
+	auto &get = op.get().Cast<LogicalGet>();
+	if (!get.function.pushdown_aggregate) {
+		return nullptr;
+	}
+	return &get;
+}
+
+//! Remap column references from the union's bindings to the leg's own output
+static void RemapToLeg(unique_ptr<Expression> &expr, TableIndex setop_index,
+                       const vector<ColumnBinding> &leg_bindings, const vector<LogicalType> &leg_types) {
+	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+	    expr, [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &node) {
+		    if (col_ref.Binding().table_index != setop_index) {
+			    return;
+		    }
+		    auto col = col_ref.Binding().column_index.GetIndex();
+		    node = make_uniq<BoundColumnRefExpression>(col_ref.GetAlias(), leg_types[col], leg_bindings[col]);
+	    });
+}
+
+static unique_ptr<LogicalAggregate> CreateLegAggregate(Optimizer &optimizer, const LogicalAggregate &aggr,
+                                                       const LogicalSetOperation &setop,
+                                                       unique_ptr<LogicalOperator> leg) {
+	// operators inserted by earlier passes (e.g. filters distributed through the union) may not
+	// have their types resolved yet
+	leg->ResolveOperatorTypes();
+	auto leg_bindings = leg->GetColumnBindings();
+	auto &leg_types = leg->types;
+	vector<unique_ptr<Expression>> aggregates;
+	for (auto &expr : aggr.expressions) {
+		auto copy = expr->Copy();
+		RemapToLeg(copy, setop.table_index, leg_bindings, leg_types);
+		aggregates.push_back(std::move(copy));
+	}
+	auto leg_aggr = make_uniq<LogicalAggregate>(optimizer.binder.GenerateTableIndex(),
+	                                            optimizer.binder.GenerateTableIndex(), std::move(aggregates));
+	for (auto &group : aggr.groups) {
+		auto copy = group->Copy();
+		RemapToLeg(copy, setop.table_index, leg_bindings, leg_types);
+		leg_aggr->groups.push_back(std::move(copy));
+	}
+	leg_aggr->children.push_back(std::move(leg));
+	leg_aggr->ResolveOperatorTypes();
+	return leg_aggr;
+}
+
+//! Substitute column references to a projection by (copies of) the projection's expressions
+static bool InlineProjection(unique_ptr<Expression> &expr, const LogicalProjection &proj) {
+	bool ok = true;
+	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+	    expr, [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &node) {
+		    if (col_ref.Binding().table_index != proj.table_index) {
+			    return;
+		    }
+		    auto col = col_ref.Binding().column_index.GetIndex();
+		    if (col >= proj.expressions.size()) {
+			    ok = false;
+			    return;
+		    }
+		    node = proj.expressions[col]->Copy();
+	    });
+	return ok;
+}
+
+//! Try to absorb a freshly built per-leg aggregate into the leg's scan; returns the scan on
+//! success (with its schema re-pointed at the grouped result), nullptr otherwise.
+static unique_ptr<LogicalOperator> TryFoldLegAggregate(ClientContext &context, LogicalAggregate &leg_aggr,
+                                                       const vector<LogicalType> &output_types) {
+	auto get = FindAggregatePushdownGet(*leg_aggr.children[0]);
+	if (!get) {
+		return nullptr;
+	}
+	// inline the projection chain between the aggregate and the scan into the aggregate's
+	// expressions, so every column reference points at the scan
+	vector<unique_ptr<Expression>> groups;
+	vector<unique_ptr<Expression>> aggregates;
+	for (auto &group : leg_aggr.groups) {
+		groups.push_back(group->Copy());
+	}
+	for (auto &expr : leg_aggr.expressions) {
+		aggregates.push_back(expr->Copy());
+	}
+	reference<LogicalOperator> op(*leg_aggr.children[0]);
+	while (op.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op.get().Cast<LogicalProjection>();
+		for (auto &group : groups) {
+			if (!InlineProjection(group, proj)) {
+				return nullptr;
+			}
+		}
+		for (auto &expr : aggregates) {
+			if (!InlineProjection(expr, proj)) {
+				return nullptr;
+			}
+		}
+		op = *op.get().children[0];
+	}
+	auto &target = op.get().Cast<LogicalGet>();
+	for (auto &group : groups) {
+		if (!ReferencesOnly(*group, target.table_index)) {
+			return nullptr;
+		}
+	}
+	for (auto &expr : aggregates) {
+		if (!ReferencesOnly(*expr, target.table_index)) {
+			return nullptr;
+		}
+	}
+	vector<LogicalType> new_types;
+	vector<Identifier> new_names;
+	if (!target.function.pushdown_aggregate(context, target, target.bind_data.get(), groups, aggregates, new_types,
+	                                        new_names)) {
+		return nullptr;
+	}
+	if (new_types != output_types || new_names.size() != new_types.size()) {
+		throw InternalException("pushdown_aggregate returned a schema that does not match the aggregate's output");
+	}
+	// the scan now produces the grouped result directly
+	target.returned_types = new_types;
+	target.names = std::move(new_names);
+	vector<ColumnIndex> column_ids;
+	for (idx_t i = 0; i < new_types.size(); i++) {
+		column_ids.emplace_back(i);
+	}
+	target.SetColumnIds(std::move(column_ids));
+	target.projection_ids.clear();
+	target.table_filters = TableFilterSet();
+	target.ResolveOperatorTypes();
+	// extract the scan from the bottom of the chain
+	reference<unique_ptr<LogicalOperator>> holder(leg_aggr.children[0]);
+	while (holder.get()->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		holder = holder.get()->children[0];
+	}
+	return std::move(holder.get());
+}
+
+bool PartialAggregatePushdown::TryPushdownUnionAggregate(unique_ptr<LogicalOperator> &op) {
+	LogicalAggregate *aggr;
+	LogicalSetOperation *setop;
+	if (!GetUnionPushdownOperators(*op, aggr, setop)) {
+		return false;
+	}
+	vector<idx_t> group_columns;
+	if (!GetUnionGroupColumns(*aggr, *setop, group_columns)) {
+		return false;
+	}
+	for (auto &expr : aggr->expressions) {
+		if (!ReferencesOnly(*expr, setop->table_index)) {
+			return false;
+		}
+	}
+	if (!HasDisjointLegTag(*setop, group_columns)) {
+		return false;
+	}
+	// only worthwhile when at least one leg's scan could absorb the aggregate
+	bool any_candidate = false;
+	for (auto &leg : setop->children) {
+		if (FindAggregatePushdownGet(*leg)) {
+			any_candidate = true;
+			break;
+		}
+	}
+	if (!any_candidate) {
+		return false;
+	}
+
+	vector<LogicalType> output_types;
+	for (auto &group : aggr->groups) {
+		output_types.push_back(group->GetReturnType());
+	}
+	for (auto &expr : aggr->expressions) {
+		output_types.push_back(expr->GetReturnType());
+	}
+
+	vector<unique_ptr<LogicalAggregate>> leg_aggregates;
+	vector<unique_ptr<LogicalOperator>> new_children;
+	idx_t folded_count = 0;
+	for (auto &leg : setop->children) {
+		auto leg_aggr = CreateLegAggregate(optimizer, *aggr, *setop, std::move(leg));
+		auto folded = TryFoldLegAggregate(optimizer.context, *leg_aggr, output_types);
+		if (folded) {
+			folded_count++;
+			new_children.push_back(std::move(folded));
+		} else {
+			new_children.push_back(std::move(leg_aggr));
+		}
+	}
+	if (folded_count == 0) {
+		// no scan absorbed its aggregate - splitting alone has no benefit; restore the legs
+		for (idx_t i = 0; i < setop->children.size(); i++) {
+			setop->children[i] = std::move(new_children[i]->children[0]);
+		}
+		return false;
+	}
+
+	auto new_setop = make_uniq<LogicalSetOperation>(optimizer.binder.GenerateTableIndex(), output_types.size(),
+	                                                std::move(new_children), LogicalOperatorType::LOGICAL_UNION,
+	                                                /*setop_all=*/true, setop->allow_out_of_order);
+	new_setop->ResolveOperatorTypes();
+	new_setop->estimated_cardinality = aggr->estimated_cardinality;
+	new_setop->has_estimated_cardinality = aggr->has_estimated_cardinality;
+
+	for (idx_t i = 0; i < aggr->groups.size(); i++) {
+		replacement_map[ColumnBinding(aggr->group_index, ProjectionIndex(i))] =
+		    ColumnBinding(new_setop->table_index, ProjectionIndex(i));
+	}
+	for (idx_t i = 0; i < aggr->expressions.size(); i++) {
+		replacement_map[ColumnBinding(aggr->aggregate_index, ProjectionIndex(i))] =
+		    ColumnBinding(new_setop->table_index, ProjectionIndex(aggr->groups.size() + i));
+	}
+	op = std::move(new_setop);
+	return true;
+}
+
 void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 	LogicalOperatorVisitor::VisitOperator(op);
-	TryPushdownAggregate(op);
+	if (!TryPushdownUnionAggregate(op)) {
+		TryPushdownAggregate(op);
+	}
 }
 
 unique_ptr<Expression> PartialAggregatePushdown::VisitReplace(BoundColumnRefExpression &expr,
