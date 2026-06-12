@@ -23,7 +23,7 @@ BaseTableFunction::BaseTableFunction(table_function_t function_, table_function_
     : bind(bind), bind_replace(nullptr), bind_operator(nullptr), init_global(init_global), init_local(init_local),
       function(function_), in_out_function(nullptr), in_out_function_final(nullptr), statistics(nullptr),
       statistics_extended(nullptr), dependency(nullptr), cardinality(nullptr), get_metrics(nullptr),
-      pushdown_complex_filter(nullptr), pushdown_expression(nullptr), to_string(nullptr), table_scan_progress(nullptr),
+      pushdown_complex_filter(nullptr), pushdown_expression(nullptr), pushdown_aggregate(nullptr), to_string(nullptr), table_scan_progress(nullptr),
       get_partition_data(nullptr), get_bind_info(nullptr), projection_expression_pushdown(nullptr),
       get_multi_file_reader(nullptr), supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr),
       is_repeatable(nullptr), get_partition_info(nullptr), get_partition_stats(nullptr), get_virtual_columns(nullptr),
@@ -94,6 +94,7 @@ BoundTableFunction::BoundTableFunction(shared_ptr<const TableFunction> function_
 	get_metrics = function.get_metrics;
 	pushdown_complex_filter = function.pushdown_complex_filter;
 	pushdown_expression = function.pushdown_expression;
+	pushdown_aggregate = function.pushdown_aggregate;
 	to_string = function.to_string;
 	to_sql = function.to_sql;
 	table_scan_progress = function.table_scan_progress;
