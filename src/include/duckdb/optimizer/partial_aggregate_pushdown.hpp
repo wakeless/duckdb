@@ -31,6 +31,7 @@ private:
 	bool TryOwnerOuterCountPushdown(unique_ptr<LogicalOperator> &op);
 	//! One-sided eager group-by: push a partial aggregate (via state export) below the join on one side only.
 	bool TryPushdownAggregate(unique_ptr<LogicalOperator> &op);
+	bool TryPushdownUnionAggregate(unique_ptr<LogicalOperator> &op);
 	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override;
 
 private:
