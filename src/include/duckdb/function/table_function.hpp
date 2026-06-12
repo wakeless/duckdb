@@ -424,6 +424,14 @@ typedef unique_ptr<FunctionData> (*table_function_combine_schema_t)(ClientContex
                                                                     TableFunctionCombineSchemaInput &input,
                                                                     vector<LogicalType> &return_types,
                                                                     vector<Identifier> &names);
+//! Push a grouped aggregate into the table scan. The group and aggregate expressions reference the scan's
+//! projected columns (BoundColumnRefExpression whose binding.column_index indexes the LogicalGet's column ids)
+//! or are constants over them. The function must only mutate its bind data when it returns true, and then
+//! provides the scan's new output schema: the groups first, then the aggregates.
+typedef bool (*table_function_pushdown_aggregate_t)(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
+                                                    const vector<unique_ptr<Expression>> &groups,
+                                                    const vector<unique_ptr<Expression>> &aggregates,
+                                                    vector<LogicalType> &new_types, vector<Identifier> &new_names);
 typedef InsertionOrderPreservingMap<string> (*table_function_to_string_t)(TableFunctionToStringInput &input);
 
 typedef void (*table_function_serialize_t)(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
@@ -555,6 +563,8 @@ public:
 	table_function_supports_read_ahead_t supports_read_ahead;
 	//! (Optional) schedules the I/O of a claimed batch - see table_function_schedule_io_t
 	table_function_schedule_io_t schedule_io;
+	//! (Optional) absorb a grouped aggregate into the scan, replacing the scan's output with the grouped result
+	table_function_pushdown_aggregate_t pushdown_aggregate;
 	//! (Optional) function for rendering the operator to a string in explain/profiling output (invoked pre-execution)
 	table_function_to_string_t to_string;
 	//! (Optional) return how much of the table we have scanned up to this point (% of the data)
