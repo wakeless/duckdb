@@ -24,6 +24,7 @@
 #include "duckdb/optimizer/join_elimination.hpp"
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 #include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
+#include "duckdb/optimizer/join_union_pushdown.hpp"
 #include "duckdb/optimizer/limit_pushdown.hpp"
 #include "duckdb/optimizer/regex_range_filter.hpp"
 #include "duckdb/optimizer/remove_duplicate_groups.hpp"
@@ -364,6 +365,13 @@ void Optimizer::RunBuiltInOptimizers() {
 		AggregateReuseOptimizer aggregate_reuse(*this);
 		aggregate_reuse.CollectCTEs(*plan);
 		aggregate_reuse.VisitOperator(plan);
+	});
+
+	// Decompose joins over tag-disjoint UNION ALLs into per-leg joins, absorbing same-source
+	// per-leg joins into their scans (TableFunction::pushdown_join).
+	RunOptimizer(OptimizerType::JOIN_UNION_PUSHDOWN, [&]() {
+		JoinUnionPushdown join_union_pushdown(*this);
+		join_union_pushdown.VisitOperator(plan);
 	});
 
 	// Pre-aggregate SUM/COUNT below joins when GROUP BY is on dimension columns

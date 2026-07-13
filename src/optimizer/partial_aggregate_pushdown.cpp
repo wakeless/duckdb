@@ -10,6 +10,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/function/builtin_function_lookup.hpp"
+#include "duckdb/optimizer/join_union_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/relation_statistics/relation_statistics_extractor.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -1152,35 +1153,10 @@ static bool GetUnionGroupColumns(const LogicalAggregate &aggr, const LogicalSetO
 	return true;
 }
 
-//! Resolve a union output column within a leg, descending through column-reference projection
-//! steps; returns the defining expression, or nullptr when it cannot be traced.
+//! Resolve a union output column within a leg (see JoinUnionPushdown::ResolveLegColumn, which
+//! also descends through filters and the per-leg joins that pass produces)
 static const Expression *ResolveLegColumn(const LogicalOperator &leg, idx_t column) {
-	auto op = &leg;
-	idx_t col = column;
-	while (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		if (col >= op->expressions.size()) {
-			return nullptr;
-		}
-		auto &expr = *op->expressions[col];
-		if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return &expr;
-		}
-		auto &binding = expr.Cast<BoundColumnRefExpression>().Binding();
-		auto child_bindings = op->children[0]->GetColumnBindings();
-		optional_idx next;
-		for (idx_t i = 0; i < child_bindings.size(); i++) {
-			if (child_bindings[i] == binding) {
-				next = i;
-				break;
-			}
-		}
-		if (!next.IsValid()) {
-			return nullptr;
-		}
-		col = next.GetIndex();
-		op = op->children[0].get();
-	}
-	return nullptr;
+	return JoinUnionPushdown::ResolveLegColumn(leg, column);
 }
 
 //! Whether any group key resolves to a non-NULL constant that differs in every leg, which makes
