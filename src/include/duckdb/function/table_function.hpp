@@ -45,6 +45,8 @@ struct MultiFileReader;
 struct OperatorPartitionData;
 struct OperatorPartitionInfo;
 struct OperatorMetrics;
+struct JoinCondition;
+enum class JoinType : uint8_t;
 enum class OrderByColumnType : uint8_t;
 enum class OrderType : uint8_t;
 enum class OrderByStatistics : uint8_t;
@@ -368,6 +370,16 @@ typedef bool (*table_function_pushdown_aggregate_t)(ClientContext &context, Logi
                                                     const vector<unique_ptr<Expression>> &groups,
                                                     const vector<unique_ptr<Expression>> &aggregates,
                                                     vector<LogicalType> &new_types, vector<Identifier> &new_names);
+//! Absorb a join of two scans of the same table function into the left scan. Every condition's left expression
+//! references only left_get and its right expression only right_get (BoundColumnRefExpression whose
+//! binding.column_index indexes that LogicalGet's column ids), or is constant. The function must only mutate the
+//! left scan's bind data when it returns true, and is then responsible for both sides' table filters and
+//! projections; it provides the merged scan's output schema: the left scan's output columns (post projection),
+//! then the right scan's.
+typedef bool (*table_function_pushdown_join_t)(ClientContext &context, LogicalGet &left_get, LogicalGet &right_get,
+                                               FunctionData *left_bind_data, FunctionData *right_bind_data,
+                                               JoinType join_type, const vector<JoinCondition> &conditions,
+                                               vector<LogicalType> &new_types, vector<Identifier> &new_names);
 typedef InsertionOrderPreservingMap<string> (*table_function_to_string_t)(TableFunctionToStringInput &input);
 
 typedef void (*table_function_serialize_t)(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
@@ -490,6 +502,8 @@ public:
 	table_function_pushdown_expression_t pushdown_expression;
 	//! (Optional) absorb a grouped aggregate into the scan, replacing the scan's output with the grouped result
 	table_function_pushdown_aggregate_t pushdown_aggregate;
+	//! (Optional) absorb a join of two scans of this function into the left scan, replacing both with one scan
+	table_function_pushdown_join_t pushdown_join;
 	//! (Optional) function for rendering the operator to a string in explain/profiling output (invoked pre-execution)
 	table_function_to_string_t to_string;
 	//! (Optional) return how much of the table we have scanned up to this point (% of the data)
