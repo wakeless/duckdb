@@ -58,6 +58,7 @@ static const DefaultOptimizerType internal_optimizer_types[] = {
     {"distinct_aggregate_rewrite", OptimizerType::DISTINCT_AGGREGATE_REWRITE},
     {"aggregate_reuse", OptimizerType::AGGREGATE_REUSE},
     {"projection_placement", OptimizerType::PROJECTION_PLACEMENT},
+    {"join_union_pushdown", OptimizerType::JOIN_UNION_PUSHDOWN},
     {nullptr, OptimizerType::INVALID}};
 
 string OptimizerTypeToString(OptimizerType type) {

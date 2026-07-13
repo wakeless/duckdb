@@ -1,0 +1,89 @@
+# name: test/optimizer/join_union_pushdown.test
+# description: joins over tag-disjoint UNION ALLs stay correct whether or not they decompose
+# group: [optimizer]
+# note: with plain tables no scan implements pushdown_join, so the rewrite never fires; these
+# results pin the semantics the join_union_pushdown optimizer must preserve when it does.
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+create table t1(id int, v int);
+
+statement ok
+insert into t1 values (1, 10), (2, 20), (5, 50), (NULL, 99);
+
+statement ok
+create table r1(id int, v int);
+
+statement ok
+insert into r1 values (1, 100), (2, 200), (4, 400);
+
+statement ok
+create table t2(id int, w int);
+
+statement ok
+insert into t2 values (1, 11), (5, 55), (6, 66);
+
+statement ok
+create table r2(id int, w int);
+
+statement ok
+insert into r2 values (1, 111), (3, 333), (4, 444), (NULL, 999);
+
+statement ok
+create view u1 as (select 'a' as site, * from t1) union all (select 'b' as site, * from r1);
+
+statement ok
+create view u2 as (select 'a' as site, * from t2) union all (select 'b' as site, * from r2);
+
+# inner join on (site, id): sites never mix; NULL keys match nothing
+query IIII
+select p.site, p.id, p.v, q.w from u1 p join u2 q on q.site = p.site and q.id = p.id order by p.site, p.id;
+----
+a	1	10	11
+a	5	50	55
+b	1	100	111
+b	4	400	444
+
+# left join NULL-pads within the leg
+query IIII
+select p.site, p.id, p.v, q.w from u1 p left join u2 q on q.site = p.site and q.id = p.id order by p.site, p.id;
+----
+a	1	10	11
+a	2	20	NULL
+a	5	50	55
+a	NULL	99	NULL
+b	1	100	111
+b	2	200	NULL
+b	4	400	444
+
+# without the tag equality sites mix: cross-leg matches are real
+query I
+select count(*) from u1 p join u2 q on q.id = p.id;
+----
+6
+
+# mismatched tag sets (three legs vs two) still answer correctly
+statement ok
+create table o1(id int, v int);
+
+statement ok
+insert into o1 values (1, 7);
+
+statement ok
+create view u1_tri as (select 'a' as site, * from t1) union all (select 'b' as site, * from r1) union all (select 'c' as site, * from o1);
+
+query I
+select count(*) from u1_tri p join u2 q on q.site = p.site and q.id = p.id;
+----
+4
+
+# UNION (distinct) legs
+statement ok
+create view u1d as (select 'a' as site, * from t1) union (select 'b' as site, * from r1);
+
+query I
+select count(*) from u1d p join u2 q on q.site = p.site and q.id = p.id;
+----
+4
