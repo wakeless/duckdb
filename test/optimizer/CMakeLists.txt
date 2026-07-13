@@ -10,6 +10,7 @@ add_library_unity(
   relation_statistics.cpp
   remove_unused_columns.cpp
   unchecked_cast.cpp
+  join_union_pushdown.cpp
   union_alls.cpp)
 
 set(UNITTEST_OBJECT_FILES
