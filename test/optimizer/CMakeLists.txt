@@ -5,6 +5,7 @@ add_library_unity(
   common_subplan_nonserializable.cpp
   filter_pushdown_alias.cpp
   join_order_conflict_detector.cpp
+  join_union_pushdown.cpp
   union_alls.cpp)
 
 set(UNITTEST_OBJECT_FILES
