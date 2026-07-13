@@ -7,6 +7,7 @@ add_library_unity(
   common_subplan_nonserializable.cpp
   filter_pushdown_alias.cpp
   join_order_conflict_detector.cpp
+  join_union_pushdown.cpp
   relation_statistics.cpp
   union_alls.cpp)
 
