@@ -1,8 +1,8 @@
 diff --git a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
-index 871a005..c51f3d3 100644
+index 15fa94ede..22ed11be4 100644
 --- a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
 +++ b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
-@@ -327,7 +327,7 @@ void IntroduceNewSchema(IcebergTable &updated_table, IcebergTransactionData &tra
+@@ -456,7 +456,7 @@ void IntroduceNewSchema(IcebergTable &updated_table, IcebergTransactionData &tra
  
  template <typename T>
  IcebergColumnDefinition &ResolveColumn(T &alter_table_info, const shared_ptr<IcebergTableSchema> &new_schema) {
@@ -11,7 +11,7 @@ index 871a005..c51f3d3 100644
  
  	auto column_p = new_schema->GetMutableFromPath({column_name}, nullptr);
  	if (!column_p) {
-@@ -524,7 +524,7 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+@@ -660,7 +660,7 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
  			throw NotImplementedException("ALTER TYPE with a USING expression is not supported for Iceberg tables");
  		}
  		auto &column_path = cast.Child().Cast<ColumnRefExpression>().ColumnNames();
@@ -20,7 +20,7 @@ index 871a005..c51f3d3 100644
  			throw NotImplementedException("ALTER TYPE with a USING expression is not supported for Iceberg tables");
  		}
  		auto column_p = new_schema->GetMutableFromPath(column_path, nullptr);
-@@ -578,6 +578,9 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+@@ -714,6 +714,9 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
  	}
  	case AlterTableType::DROP_NOT_NULL: {
  		auto &drop_not_null_info = alter_table_info.Cast<DropNotNullInfo>();
@@ -29,8 +29,8 @@ index 871a005..c51f3d3 100644
 +		}
  
  		auto new_schema = current_schema.Copy();
- 		new_schema->schema_id++;
-@@ -695,7 +698,10 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 
+@@ -822,7 +825,10 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
  	}
  	case AlterTableType::SET_DEFAULT: {
  		auto &set_default_info = alter_table_info.Cast<SetDefaultInfo>();
